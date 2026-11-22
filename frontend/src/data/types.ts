@@ -25,6 +25,18 @@ export type PageResult = {
   total: number
   page: number
   size: number
+  next_cursor?: string | null
+}
+
+export type RecoveryCandidate = EntryRow & {
+  entry_id: number | null
+  采集来源?: string
+  source_module?: string
+  source_id?: number | string | null
+  失败范围?: string
+  关联运行?: number | string | null
+  from_file?: boolean
+  in_memory?: boolean
 }
 
 export type ActionResult = {

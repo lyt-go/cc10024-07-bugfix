@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult, RecoverPayload
 from app.services import service_for
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -39,6 +39,28 @@ def list_entries(
     items, total = service.list_entries(
         filters=filters, keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/{module}/recovery-candidates", response_model=PageResult[dict])
+def list_recovery_candidates(
+    module: str,
+    keyword: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    failed_only: bool = Query(default=False),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
+    cursor: str | None = Query(default=None),
+) -> PageResult[dict]:
+    """恢复候选：内存运行 + 已落盘回执合并去重后的稳定分页查询。"""
+    service = require_service(module)
+    lister = getattr(service, "list_recovery_candidates", None)
+    if lister is None:
+        raise HTTPException(status_code=404, detail=f"模块 {module} 不支持恢复候选查询")
+    items, total, next_cursor = lister(
+        failed_only=failed_only, keyword=keyword, status=status,
+        page=page, size=size, cursor=cursor)
+    return PageResult(items=items, total=total, page=page, size=size,
+                      next_cursor=next_cursor)
 
 
 @router.get("/{module}/export")
@@ -89,6 +111,31 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
+
+
+@router.post("/{module}/recover", response_model=ActionResult)
+def recover_from_candidate(module: str, payload: RecoverPayload) -> ActionResult:
+    """按选中的恢复候选发起重采；拒绝与选中运行不一致的候选。"""
+    service = require_service(module)
+    handler = getattr(service, "recover_from_candidate", None)
+    if handler is None:
+        raise HTTPException(status_code=404, detail=f"模块 {module} 不支持错误恢复")
+    candidate = dict(payload.candidate or {})
+    if payload.entry_id is not None:
+        if candidate.get("entry_id") is not None \
+                and int(candidate["entry_id"]) != int(payload.entry_id):
+            return ActionResult(ok=False, message="候选运行与提交的运行ID不一致")
+        candidate["entry_id"] = payload.entry_id
+    if payload.record_code:
+        if candidate.get("记录编号") and candidate["记录编号"] != payload.record_code:
+            return ActionResult(ok=False, message="候选记录与提交的记录编号不一致")
+        candidate["记录编号"] = payload.record_code
+    if not candidate:
+        return ActionResult(ok=False, message="未选择要恢复的运行记录")
+    values = dict(payload.values)
+    values.setdefault("action", payload.action)
+    entry, message = handler(candidate, **values)
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)

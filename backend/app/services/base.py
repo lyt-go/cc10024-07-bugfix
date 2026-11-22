@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Callable
 
 from app.store import store
@@ -26,9 +27,6 @@ def register_hook(module: str, action: str, callback: Callable[[dict[str, Any]],
     _CROSS_MODULE_HOOKS[key].append(callback)
 
 
-import json
-
-
 class BaseModuleService:
     MODULE = ""
     ENTITY = ""
@@ -47,6 +45,8 @@ class BaseModuleService:
         status: str | None = None,
         page: int = 1,
         size: int = 20,
+        abnormal: bool | None = None,
+        failed_only: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
         rows = list(store.rows(self.MODULE))
         for field, expected in (filters or {}).items():
@@ -60,9 +60,22 @@ class BaseModuleService:
             rows = [row for row in rows if keyword.casefold() in str(row.get(field, "")).casefold()]
         if status:
             rows = [row for row in rows if row.get("status") == status]
+        if abnormal is not None:
+            rows = [row for row in rows if bool(row.get("abnormal")) is abnormal]
+        if failed_only:
+            rows = [
+                row for row in rows
+                if bool(row.get("abnormal")) or row.get("status") in {"已失败", "失败", "已超时"}
+            ]
         total = len(rows)
         start = (page - 1) * size
         return rows[start:start + size], total
+
+    def _next_entry_id(self, rows: list[dict[str, Any]]) -> int:
+        if self.MODULE == "run_history":
+            # 运行历史ID必须避开磁盘中已落盘的回执，否则重启后会复用旧运行ID。
+            return persist.next_run_entry_id(rows)
+        return max((int(row.get("id", 0)) for row in rows), default=0) + 1
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
         return store.find(self.MODULE, entry_id)
@@ -75,7 +88,7 @@ class BaseModuleService:
         if missing:
             return None, missing
         rows = store.rows(self.MODULE)
-        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
+        entry = {"id": self._next_entry_id(rows)}
         entry.update({field: values.get(field) for field in self.LIST_FIELDS})
         entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
@@ -124,7 +137,19 @@ class BaseModuleService:
             "action": action,
             "timestamp": persist.now_iso(),
             "abnormal": entry.get("abnormal", False),
+            "sequence": persist.next_sequence(),
         }
+        if self.MODULE == "run_history":
+            # 回执要能独立还原一条运行记录：重启后内存只剩示例数据，
+            # 历史运行只能靠这份快照回查并作为恢复候选。
+            record["snapshot"] = {
+                field: entry.get(field, "") for field in self.LIST_FIELDS
+            }
+            for key in ("source_module", "source_id", "采集来源", "关联运行",
+                        "失败范围", "recovery_of", "parent_run_id"):
+                if key in entry:
+                    record[key] = entry[key]
+                    record["snapshot"][key] = entry[key]
         persist.append_jsonl("runs", f"{self.MODULE}.jsonl", record)
 
     def _fire_cross_module_hooks(self, entry: dict[str, Any], action: str) -> None:

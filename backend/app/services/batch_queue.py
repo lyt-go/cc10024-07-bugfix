@@ -10,14 +10,20 @@ from app import persistence as persist
 
 def _complete_batch_to_history(entry: dict[str, Any]) -> None:
     """批次确认完成时写入run_history。"""
+    with persist.run_write_lock():
+        _append_batch_run(entry)
+
+
+def _append_batch_run(entry: dict[str, Any]) -> None:
     run_rows = store.rows("run_history")
-    new_id = max((int(r.get("id", 0)) for r in run_rows), default=0) + 1
+    new_id = persist.next_run_entry_id(run_rows)
+    now = persist.now_iso()
     record = {
         "id": new_id,
         "记录编号": f"RUN-BATCH-{new_id:04d}",
         "关联计划": entry.get("关联计划", ""),
-        "开始时间": persist.now_iso(),
-        "结束时间": persist.now_iso(),
+        "开始时间": now,
+        "结束时间": now,
         "采集行数": str(entry.get("任务数量", 0)),
         "失败行数": str(entry.get("失败数", 0)),
         "执行日志": f"批次{entry.get('批次编号')}执行完成",
@@ -26,14 +32,26 @@ def _complete_batch_to_history(entry: dict[str, Any]) -> None:
         "pending": False,
         "abnormal": False,
         "version": "",
-        "updated_at": persist.now_iso(),
+        "updated_at": now,
+        "采集来源": entry.get("关联计划", ""),
+        "source_module": "batch_queue",
+        "source_id": entry.get("id"),
+        "关联运行": new_id,
+        "失败范围": entry.get("失败数", "0"),
     }
     run_rows.append(record)
     persist.append_jsonl("runs", "run_history.jsonl", {
         "module": "run_history", "entity": "运行记录", "entry_id": new_id,
         "status": "已完成", "version": "", "action": "auto_create_from_batch",
-        "timestamp": persist.now_iso(), "abnormal": False,
+        "timestamp": now, "abnormal": False, "sequence": persist.next_sequence(),
         "source_module": "batch_queue", "source_id": entry.get("id"),
+        "采集来源": record["采集来源"],
+        "snapshot": {key: record.get(key, "") for key in (
+            "记录编号", "关联计划", "开始时间", "结束时间", "采集行数",
+            "失败行数", "执行日志", "异常摘要")} | {
+            "采集来源": record["采集来源"],
+            "source_module": "batch_queue", "source_id": entry.get("id"),
+        },
     })
 
 register_hook("batch_queue", "确认完成", _complete_batch_to_history)

@@ -33,6 +33,15 @@
         <span>{{ field }}</span>
         <input v-model="filters[field]" :data-testid="`filter-${field}`" :placeholder="`按${field}检索`" />
       </label>
+      <label v-if="isRecovery" class="filter-item">
+        <span>只看失败</span>
+        <input
+          v-model="failedOnly"
+          data-testid="filter-failed-only"
+          type="checkbox"
+          @change="resetCursorAndReload"
+        />
+      </label>
       <button class="btn" data-testid="query" type="submit">查询</button>
       <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
@@ -40,16 +49,25 @@
     <table class="data-table">
       <thead>
         <tr>
-          <th v-for="column in meta.fields" :key="column">{{ column }}</th>
+          <th v-for="column in displayFields" :key="column">{{ column }}</th>
           <th>当前状态</th>
           <th>可执行动作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
-          <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-for="column in displayFields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
+            <button
+              v-if="isRecovery"
+              class="link"
+              type="button"
+              :data-testid="`recover-${row.id}`"
+              @click="recover(row)"
+            >
+              按此运行重采
+            </button>
             <button
               v-for="action in meta.actions"
               :key="action"
@@ -63,7 +81,7 @@
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="meta.fields.length + 2" class="empty-state">
+          <td :colspan="displayFields.length + 2" class="empty-state">
             暂无{{ meta.name }}数据，可先登记{{ meta.entity }}
           </td>
         </tr>
@@ -86,8 +104,19 @@
       </form>
     </div>
 
+    <div v-if="isRecovery" class="page-actions cursor-bar">
+      <button class="btn ghost" data-testid="cursor-prev" type="button" :disabled="!cursorStack.length" @click="previousPage">
+        上一页
+      </button>
+      <button class="btn" data-testid="cursor-next" type="button" :disabled="!nextCursor" @click="nextPage">
+        下一页
+      </button>
+      <span class="cursor-note">按运行时间稳定翻页，同一秒落盘也能逐页取全</span>
+    </div>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
+      <span v-if="recoveryMessage" class="ok-text">{{ recoveryMessage }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
@@ -100,18 +129,33 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  listRecoveryCandidates,
   moduleMeta,
+  recoverFromCandidate,
   runAction as applyAction,
 } from '@/api/backend-service'
-import type { EntryRow } from '@/data/types'
+import type { EntryRow, RecoveryCandidate } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+// 运行历史与错误恢复共用合并后的恢复候选：谁选中的运行就由谁发起重采。
+const isRecovery = computed(() => meta.key === 'run_history' || meta.key === 'error_recover')
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const recoveryMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = meta.fields.slice(0, 3)
+// 恢复视图展示的是合并后的运行候选，列要能看出实际采集来源与失败范围。
+const displayFields = computed(() =>
+  isRecovery.value
+    ? ['记录编号', '关联计划', '开始时间', '采集来源', '失败范围', '执行日志']
+    : meta.fields,
+)
+const failedOnly = ref(false)
+const nextCursor = ref<string | null>(null)
+const cursorStack = ref<(string | null)[]>([])
+const currentCursor = ref<string | null>(null)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
@@ -132,7 +176,49 @@ const statusSummary = computed(() =>
 
 function resetFilters() {
   filters.value = {}
+  failedOnly.value = false
+  cursorStack.value = []
+  currentCursor.value = null
   void reload()
+}
+
+function resetCursorAndReload() {
+  cursorStack.value = []
+  currentCursor.value = null
+  void reload()
+}
+
+async function nextPage() {
+  if (!nextCursor.value) return
+  cursorStack.value = [...cursorStack.value, currentCursor.value]
+  currentCursor.value = nextCursor.value
+  await reload()
+}
+
+async function previousPage() {
+  if (!cursorStack.value.length) return
+  const stack = [...cursorStack.value]
+  currentCursor.value = stack.pop() ?? null
+  cursorStack.value = stack
+  await reload()
+}
+
+async function recover(row: EntryRow) {
+  errorMessage.value = ''
+  recoveryMessage.value = ''
+  try {
+    // 恢复必须带上选中的那次运行本身，后端会核对运行ID/记录编号。
+    const candidate = row as RecoveryCandidate
+    const result = await recoverFromCandidate(meta.key, {
+      ...candidate,
+      entry_id: candidate.entry_id ?? Number(row.id),
+    })
+    if (!result.ok) throw new Error(result.message)
+    recoveryMessage.value = result.message
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '发起重采失败'
+  }
 }
 
 async function exportRows() {
@@ -179,6 +265,19 @@ async function runAction(action: string, row: EntryRow) {
 async function reload() {
   errorMessage.value = ''
   try {
+    if (isRecovery.value) {
+      const keyword = filters.value[meta.fields[0]] || undefined
+      const payload = await listRecoveryCandidates(meta.key, {
+        failedOnly: failedOnly.value,
+        keyword,
+        cursor: currentCursor.value,
+        size: 20,
+      })
+      rows.value = payload.items
+      total.value = payload.total
+      nextCursor.value = payload.next_cursor ?? null
+      return
+    }
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
